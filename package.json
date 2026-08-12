@@ -1,0 +1,19 @@
+{
+  "name": "SOTD_Discord_Bot",
+  "version": "1.0.0",
+  "description": "Run-based Discord Song of the Day collection, scheduling, and polling bot.",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "register": "node src/register-commands.js",
+    "test": "node test/sotd-service.test.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.24.0",
+    "dotenv": "^17.2.1"
+  }
+}
