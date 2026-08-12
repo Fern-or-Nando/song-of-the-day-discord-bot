@@ -21,14 +21,30 @@ function decodeHtml(value = '') {
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x27;/g, "'");
 }
 
-function splitTitle(raw) {
-  const clean = raw
-    .replace(/\s*(?:[|·•]|\s[-–—]\s)\s*(?:Spotify|Apple Music|TIDAL|YouTube Music)(?:\s.*)?$/i, '')
-    .replace(/\s+(?:on|from)\s+(?:Spotify|Apple Music|TIDAL|YouTube Music)\s*$/i, '')
+function cleanServiceText(value = '') {
+  return value
+    .replace(/\s+(?:on|from)\s+(?:Spotify|Apple Music|TIDAL|YouTube Music)\b.*$/i, '')
+    .replace(/\s*(?:[|·•]|\s[-–—]\s)\s*(?:Spotify|Apple Music|TIDAL|YouTube Music)\b.*$/i, '')
+    .replace(/\s*\((?:Spotify|Apple Music|TIDAL|YouTube Music)\)\s*$/i, '')
     .trim();
+}
+
+function splitTitle(raw) {
+  const clean = cleanServiceText(raw);
+  const appleStyle = clean.match(/^(.+?)\s+by\s+(.+)$/i);
+  if (appleStyle) {
+    return { title: appleStyle[1].trim(), artist: cleanServiceText(appleStyle[2]) || null };
+  }
   const parts = clean.split(/\s+[-–—]\s+/);
   if (parts.length >= 2) return { title: parts[0].trim(), artist: parts.slice(1).join(' - ').trim() };
   return { title: clean || 'Song', artist: null };
+}
+
+function cleanMetadata(title, artist) {
+  const parsed = splitTitle(title || 'Song');
+  let cleanedArtist = cleanServiceText(artist || parsed.artist || '');
+  if (/^(Spotify|Apple Music|TIDAL|YouTube Music)$/i.test(cleanedArtist)) cleanedArtist = '';
+  return { title: cleanServiceText(parsed.title) || 'Song', artist: cleanedArtist || null };
 }
 
 async function fetchMetadata(url) {
@@ -43,13 +59,13 @@ async function fetchMetadata(url) {
         const data = await response.json();
         const result = splitTitle(data.title || '');
         if (data.author_name && !result.artist) result.artist = data.author_name;
-        if (result.artist || parsed.hostname !== 'open.spotify.com') return result;
+        if (result.artist || parsed.hostname !== 'open.spotify.com') return cleanMetadata(result.title, result.artist);
         const page = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0 SOTDDiscordBot/1.0' }, signal: AbortSignal.timeout(10_000) });
         const html = await page.text();
         const description = decodeHtml(html.match(/<meta[^>]+(?:property|name)=["'](?:og:description|description)["'][^>]+content=["']([^"']+)/i)?.[1] || '');
         const pieces = description.split(/\s*[·•]\s*/).filter(Boolean);
         if (pieces.length >= 2) result.artist = pieces[1].trim();
-        return result;
+        return cleanMetadata(result.title, result.artist);
       }
     }
 
@@ -61,7 +77,7 @@ async function fetchMetadata(url) {
     const result = splitTitle(title);
     const artistMatch = description.match(/(?:by|from)\s+([^.,|]+)/i);
     if (!result.artist && artistMatch) result.artist = artistMatch[1].trim();
-    return result;
+    return cleanMetadata(result.title, result.artist);
   } catch (error) {
     console.warn(`Could not fetch metadata for ${url}: ${error.message}`);
     return { title: 'Song', artist: null };
@@ -94,7 +110,8 @@ async function handleDm(message) {
     await message.reply(`Please reply with only a link to your song. Valid sites: ${VALID_SITES}.`);
     return;
   }
-  const metadata = await fetchMetadata(url);
+  const fetchedMetadata = await fetchMetadata(url);
+  const metadata = cleanMetadata(fetchedMetadata.title, fetchedMetadata.artist);
   updateGuild(guildId, (guild) => {
     if (guild.run?.status === 'collecting') {
       guild.run.submissions[message.author.id] = { url, ...metadata, submittedAt: new Date().toISOString() };
@@ -112,8 +129,9 @@ async function postCurrent(client, guildId) {
   const guild = await client.guilds.fetch(guildId);
   const channel = await guild.channels.fetch(run.channelId);
   const item = run.schedule[run.currentIndex];
-  const question = (item.artist ? `${item.title} — ${item.artist}` : item.title).slice(0, 300);
-  const songDetails = item.artist ? `**${item.title}** by **${item.artist}**` : `**${item.title}**`;
+  const metadata = cleanMetadata(item.title, item.artist);
+  const question = (metadata.artist ? `${metadata.title} - ${metadata.artist}` : metadata.title).slice(0, 300);
+  const songDetails = metadata.artist ? `**${metadata.title} - ${metadata.artist}**` : `**${metadata.title}**`;
   await channel.send({
     content: `<@&${guildData.roleId}> It is <@${item.userId}>'s Song of the Day!\n${songDetails}\n${item.url}`,
     allowedMentions: { roles: [guildData.roleId], users: [item.userId] },
@@ -185,4 +203,4 @@ async function schedulerTick(client) {
   }
 }
 
-module.exports = { DAY, VALID_SITES, finishCollection, handleDm, postCurrent, schedulerTick, validateSongUrl };
+module.exports = { DAY, VALID_SITES, cleanMetadata, finishCollection, handleDm, postCurrent, schedulerTick, validateSongUrl };

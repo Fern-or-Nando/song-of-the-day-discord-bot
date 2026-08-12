@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { validateSongUrl } = require('../src/sotd-service');
+const { cleanMetadata, validateSongUrl } = require('../src/sotd-service');
 
 test('accepts supported music services', () => {
   for (const url of [
@@ -18,4 +18,16 @@ test('rejects text, unsupported hosts, and deceptive subdomains', () => {
   for (const value of ['hello', 'https://example.com/song', 'https://open.spotify.com.evil.test/track/abc']) {
     assert.equal(validateSongUrl(value), null, value);
   }
+});
+
+test('removes streaming service branding from song metadata', () => {
+  assert.deepEqual(cleanMetadata('Dreams by Fleetwood Mac on Apple Music', null), {
+    title: 'Dreams', artist: 'Fleetwood Mac'
+  });
+  assert.deepEqual(cleanMetadata('Dreams | Spotify', 'Fleetwood Mac'), {
+    title: 'Dreams', artist: 'Fleetwood Mac'
+  });
+  assert.deepEqual(cleanMetadata('Dreams - YouTube Music', 'YouTube Music'), {
+    title: 'Dreams', artist: null
+  });
 });
