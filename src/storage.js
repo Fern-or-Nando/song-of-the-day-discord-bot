@@ -11,14 +11,14 @@ function readStore() {
     const data = JSON.parse(fs.readFileSync(storagePath, 'utf8'));
     return { guilds: data.guilds || {} };
   } catch (error) {
-    console.error('Storage was invalid; starting with an empty store:', error);
-    return structuredClone(emptyStore);
+    throw new Error('Storage is invalid. Restore data/storage.json from backup before restarting.', { cause: error });
   }
 }
 
 function writeStore(store) {
   fs.mkdirSync(path.dirname(storagePath), { recursive: true });
-  fs.writeFileSync(storagePath, JSON.stringify(store, null, 2));
+  fs.writeFileSync(`${storagePath}.tmp`, JSON.stringify(store, null, 2));
+  fs.renameSync(`${storagePath}.tmp`, storagePath);
 }
 
 function getGuild(guildId) {

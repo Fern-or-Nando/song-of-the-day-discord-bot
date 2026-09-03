@@ -3,8 +3,10 @@ const {
   TextInputBuilder, TextInputStyle, ActionRowBuilder, PermissionFlagsBits
 } = require('discord.js');
 const config = require('./config');
+const { nextDaily, selectionDeadline } = require('./schedule');
 const { getGuild, updateGuild } = require('./storage');
 const { finishCollection, handleDm, postCurrent, schedulerTick } = require('./sotd-service');
+const { SONG_SELECTION_PROMPT, RUN_ENDED, selectionStarted } = require('./messages');
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers,
@@ -12,10 +14,17 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
+let ticking = false;
+async function tick() {
+  if (ticking) return;
+  ticking = true;
+  try { await schedulerTick(client); } catch (error) { console.error(error); }
+  finally { ticking = false; }
+}
 client.once(Events.ClientReady, (ready) => {
   console.log(`Logged in as ${ready.user.tag}`);
-  schedulerTick(client).catch(console.error);
-  setInterval(() => schedulerTick(client).catch(console.error), 30_000);
+  tick();
+  setInterval(tick, 30_000);
 });
 
 client.on(Events.MessageCreate, async (message) => {
@@ -24,10 +33,20 @@ client.on(Events.MessageCreate, async (message) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    if (!interaction.inGuild()) return;
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await interaction.reply({ content: 'Manage Server permission is required.', ephemeral: true });
+      return;
+    }
     if (interaction.isModalSubmit() && interaction.customId === 'sotd-duration') {
-      const hours = Number(interaction.fields.getTextInputValue('hours'));
-      if (!Number.isInteger(hours) || hours < 1 || hours > 8760) {
-        await interaction.reply({ content: 'Enter a whole number from 1 to 8760 hours.', ephemeral: true });
+      let deadline;
+      const dailyTime = interaction.fields.getTextInputValue('daily-time').trim();
+      const timezone = interaction.fields.getTextInputValue('timezone').trim();
+      try {
+        deadline = selectionDeadline(interaction.fields.getTextInputValue('hours'));
+        nextDaily(dailyTime, timezone);
+      } catch (error) {
+        await interaction.reply({ content: error.message, ephemeral: true });
         return;
       }
       const data = getGuild(interaction.guildId);
@@ -62,7 +81,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const sendPermission = postingChannel.isThread()
         ? PermissionFlagsBits.SendMessagesInThreads
         : PermissionFlagsBits.SendMessages;
-      if (!permissions?.has([PermissionFlagsBits.ViewChannel, sendPermission])) {
+      if (!permissions?.has([PermissionFlagsBits.ViewChannel, sendPermission, PermissionFlagsBits.SendPolls])) {
         await interaction.editReply('I cannot view or send messages in the configured destination. Update my channel permissions or choose another channel.');
         return;
       }
@@ -72,26 +91,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.editReply('That role has no non-bot members.');
         return;
       }
-      const deadline = new Date(Date.now() + hours * 60 * 60 * 1000);
-      const delivered = [];
-      const failed = [];
-      for (const member of members.values()) {
-        const sent = await member.send(
-          `You are invited to the Song of the Day run in **${interaction.guild.name}**. ` +
-          `Reply here with only one song link from Spotify, Apple Music, YouTube Music, or Tidal. ` +
-          `You have ${hours} hour(s), until <t:${Math.floor(deadline.getTime() / 1000)}:F>.`
-        ).then(() => true).catch(() => false);
-        (sent ? delivered : failed).push(member.id);
+      // Persist the roster before any DM can be answered.
+      if (getGuild(interaction.guildId).run && getGuild(interaction.guildId).run.status !== 'ended') {
+        await interaction.editReply('Another run was started while this form was open.');
+        return;
       }
       updateGuild(interaction.guildId, (guild) => {
         guild.run = {
+          id: require('crypto').randomUUID(), roleId: data.roleId,
           status: 'collecting', channelId: data.channelId, startedAt: new Date().toISOString(),
-          collectionEndsAt: deadline.toISOString(), participantIds: delivered, submissions: {},
-          reminderSent: hours <= 24, schedule: [], currentIndex: 0, nextPostAt: null
+          collectionEndsAt: deadline.toISOString(), participantIds: [...members.keys()], submissions: {},
+          reminderSent: deadline.getTime() - Date.now() < 86400000,
+          dailyTime, timezone, schedule: [], currentIndex: 0, nextPostAt: null
         };
         return guild;
       });
-      await interaction.editReply(`Run started. DMed ${delivered.length} member(s). ${failed.length} member(s) could not be DMed.`);
+      const runId = getGuild(interaction.guildId).run.id;
+      await interaction.editReply(selectionStarted(deadline));
+      const failed = [];
+      for (const member of members.values()) {
+        if (getGuild(interaction.guildId).run?.id !== runId || getGuild(interaction.guildId).run.status !== 'collecting') break;
+        const sent = await member.send(SONG_SELECTION_PROMPT).then(() => true).catch(() => false);
+        if (!sent) failed.push(member.id);
+      }
+      updateGuild(interaction.guildId, (guild) => {
+        if (guild.run?.id === runId) guild.run.failedDmIds = failed;
+        return guild;
+      });
+      if (failed.length) {
+        await interaction.followUp({ content: `${failed.length} member(s) could not be DMed. They can still submit by opening a DM with the bot.`, ephemeral: true });
+      }
       return;
     }
 
@@ -118,11 +147,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply({ content: `${channel} is now the Song of the Day posting destination.`, ephemeral: true });
     } else if (interaction.commandName === 'start-sotd-run') {
       const modal = new ModalBuilder().setCustomId('sotd-duration').setTitle('Start Song of the Day run');
-      const input = new TextInputBuilder().setCustomId('hours').setLabel('Song selection time (hours)').setPlaceholder('Example: 48')
-        .setStyle(TextInputStyle.Short).setRequired(true).setMinLength(1).setMaxLength(4);
-      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      const input = new TextInputBuilder().setCustomId('hours').setLabel('Selection hours OR end date with UTC offset').setPlaceholder('48 or 2026-09-05T18:00-05:00')
+        .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40);
+      const daily = new TextInputBuilder().setCustomId('daily-time').setLabel('Daily posting time (HH:mm)').setValue('18:00').setStyle(TextInputStyle.Short).setRequired(true);
+      const zone = new TextInputBuilder().setCustomId('timezone').setLabel('Timezone (e.g. America/Chicago)').setValue('America/Chicago').setStyle(TextInputStyle.Short).setRequired(true);
+      modal.addComponents(...[input, daily, zone].map(field => new ActionRowBuilder().addComponents(field)));
       await interaction.showModal(modal);
-    } else if (interaction.commandName === 'end-song-selection') {
+    } else if (['skip-song-selection', 'end-song-selection'].includes(interaction.commandName)) {
       const data = getGuild(interaction.guildId);
       if (data.run?.status !== 'collecting') {
         await interaction.reply({ content: 'There is no active song-selection period.', ephemeral: true });
@@ -136,7 +167,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.editReply(`Song selection ended. No songs were submitted, so the run ended. Excluded ${result.excludedCount} non-submitter(s).`);
       } else {
         await interaction.editReply(
-          `Song selection ended. Scheduled ${result.submittedCount} submitted song(s) and excluded ${result.excludedCount} non-submitter(s). The first song has been posted.`
+          `Song selection ended. Scheduled ${result.submittedCount} submitted song(s) and excluded ${result.excludedCount} non-submitter(s). Posting begins at the next daily posting time.`
         );
       }
     } else if (interaction.commandName === 'end-run') {
@@ -146,7 +177,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
       updateGuild(interaction.guildId, (guild) => { guild.run.status = 'ended'; guild.run.endedAt = new Date().toISOString(); return guild; });
-      await interaction.reply('The Song of the Day run has ended.');
+      await interaction.reply(RUN_ENDED);
     } else if (interaction.commandName === 'skip-person') {
       const data = getGuild(interaction.guildId);
       if (data.run?.status !== 'presenting') {
@@ -156,7 +187,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const next = data.run.currentIndex + 1;
       if (next >= data.run.schedule.length) {
         updateGuild(interaction.guildId, (guild) => { guild.run.status = 'ended'; guild.run.endedAt = new Date().toISOString(); return guild; });
-        await interaction.reply('The current song was skipped. That was the final person, so the run is complete.');
+        await interaction.reply(RUN_ENDED);
       } else {
         updateGuild(interaction.guildId, (guild) => { guild.run.currentIndex = next; guild.run.nextPostAt = null; return guild; });
         await interaction.deferReply({ ephemeral: true });

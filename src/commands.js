@@ -29,7 +29,7 @@ function buildCommands() {
       .setDescription('Start collecting songs from members of the configured role.')
       .setDefaultMemberPermissions(managerOnly),
     new SlashCommandBuilder()
-      .setName('end-song-selection')
+      .setName('skip-song-selection')
       .setDescription('Close song submissions now and begin with submitted songs.')
       .setDefaultMemberPermissions(managerOnly),
     new SlashCommandBuilder()
