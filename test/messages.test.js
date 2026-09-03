@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { SONG_SELECTION_PROMPT, RUN_ENDED, selectionStarted, songChosen, songAnnouncement } = require('../src/messages');
+const { SONG_SELECTION_PROMPT, RUN_ENDED, selectionStarted, songChosen, songAnnouncement, runStarted } = require('../src/messages');
 
 test('selection and completion messages use the requested wording', () => {
   const deadline = new Date('2026-09-05T18:00:00-05:00');
@@ -16,4 +16,11 @@ test('song messages keep names intact and omit an unavailable artist', () => {
   assert.equal(songChosen({ title: 'Song', artist: null }), 'Song choosen Song');
   assert.equal(songAnnouncement('role', 'user', song, 'https://example.com/song'),
     '<@&role> song of the day is Stand by Me - Live - Band - One choosen by <@user>\nhttps://example.com/song');
+});
+
+test('run start notification gives the first posting date/time and explains early closure', () => {
+  const first = '2026-09-05T23:00:00.000Z';
+  assert.equal(runStarted('role', first, true), '<@&role> Everyone has submitted a song. Song selection has ended. ' +
+    `The Song of the Day run has started! The first song will be announced <t:${Date.parse(first) / 1000}:F>.`);
+  assert.doesNotMatch(runStarted('role', first, false), /Everyone/);
 });

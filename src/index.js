@@ -1,12 +1,12 @@
 const {
-  Client, Events, GatewayIntentBits, ModalBuilder, Partials,
-  TextInputBuilder, TextInputStyle, ActionRowBuilder, PermissionFlagsBits
+  Client, Events, GatewayIntentBits, Partials, PermissionFlagsBits
 } = require('discord.js');
 const config = require('./config');
-const { nextDaily, selectionDeadline } = require('./schedule');
+const { createRunSetup } = require('./run-setup');
 const { getGuild, updateGuild } = require('./storage');
 const { finishCollection, handleDm, postCurrent, schedulerTick } = require('./sotd-service');
 const { SONG_SELECTION_PROMPT, RUN_ENDED, selectionStarted } = require('./messages');
+const runSetup = createRunSetup();
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers,
@@ -28,7 +28,7 @@ client.once(Events.ClientReady, (ready) => {
 });
 
 client.on(Events.MessageCreate, async (message) => {
-  if (!message.author.bot && !message.guild) await handleDm(message).catch(console.error);
+  if (!message.author.bot && !message.guild) await handleDm(message, client).catch(console.error);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -38,17 +38,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply({ content: 'Manage Server permission is required.', ephemeral: true });
       return;
     }
-    if (interaction.isModalSubmit() && interaction.customId === 'sotd-duration') {
-      let deadline;
-      const dailyTime = interaction.fields.getTextInputValue('daily-time').trim();
-      const timezone = interaction.fields.getTextInputValue('timezone').trim();
-      try {
-        deadline = selectionDeadline(interaction.fields.getTextInputValue('hours'));
-        nextDaily(dailyTime, timezone);
-      } catch (error) {
-        await interaction.reply({ content: error.message, ephemeral: true });
-        return;
-      }
+    if (interaction.isModalSubmit() && ['sotd-duration', 'sotd-schedule'].includes(interaction.customId)) {
+      await interaction.reply({ content: 'Please reopen /start-sotd-run to use the new scheduling form.', ephemeral: true });
+      return;
+    }
+    const isSetup = runSetup.matches(interaction);
+    const setup = isSetup ? await runSetup.handle(interaction, config.timezone) : null;
+    if (isSetup && !setup) return;
+    if (setup) {
+      const { deadline, dailyTime, timezone } = setup;
       const data = getGuild(interaction.guildId);
       if (!data.roleId) {
         await interaction.reply({ content: 'First choose a role with `/assign-sotd-role`.', ephemeral: true });
@@ -89,6 +87,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const members = role.members.filter((member) => !member.user.bot);
       if (!members.size) {
         await interaction.editReply('That role has no non-bot members.');
+        return;
+      }
+      if (deadline.getTime() <= Date.now()) {
+        await interaction.editReply('The selected end time has passed. Reopen /start-sotd-run to choose another date/time.');
         return;
       }
       // Persist the roster before any DM can be answered.
@@ -146,13 +148,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       updateGuild(interaction.guildId, (guild) => { guild.channelId = channel.id; return guild; });
       await interaction.reply({ content: `${channel} is now the Song of the Day posting destination.`, ephemeral: true });
     } else if (interaction.commandName === 'start-sotd-run') {
-      const modal = new ModalBuilder().setCustomId('sotd-duration').setTitle('Start Song of the Day run');
-      const input = new TextInputBuilder().setCustomId('hours').setLabel('Selection hours OR end date with UTC offset').setPlaceholder('48 or 2026-09-05T18:00-05:00')
-        .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40);
-      const daily = new TextInputBuilder().setCustomId('daily-time').setLabel('Daily posting time (HH:mm)').setValue('18:00').setStyle(TextInputStyle.Short).setRequired(true);
-      const zone = new TextInputBuilder().setCustomId('timezone').setLabel('Timezone (e.g. America/Chicago)').setValue('America/Chicago').setStyle(TextInputStyle.Short).setRequired(true);
-      modal.addComponents(...[input, daily, zone].map(field => new ActionRowBuilder().addComponents(field)));
-      await interaction.showModal(modal);
+      await runSetup.open(interaction, config.timezone);
     } else if (['skip-song-selection', 'end-song-selection'].includes(interaction.commandName)) {
       const data = getGuild(interaction.guildId);
       if (data.run?.status !== 'collecting') {

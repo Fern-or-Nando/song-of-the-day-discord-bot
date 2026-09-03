@@ -1,7 +1,7 @@
 const { PollLayoutType } = require('discord.js');
 const { findCollectingRunForUser, getGuild, updateGuild } = require('./storage');
 const { nextDaily } = require('./schedule');
-const { SONG_SELECTION_PROMPT, RUN_ENDED, songLabel, songChosen, songAnnouncement } = require('./messages');
+const { SONG_SELECTION_PROMPT, RUN_ENDED, songLabel, songChosen, songAnnouncement, runStarted } = require('./messages');
 const { APPLE_METADATA_SOURCE, isAppleMusicUrl, fetchAppleMetadata } = require('./apple-music');
 const { SPOTIFY_METADATA_SOURCE, isSpotifyUrl, fetchSpotifyMetadata } = require('./spotify');
 const { YOUTUBE_MUSIC_METADATA_SOURCE, isYouTubeMusicUrl, fetchYouTubeMusicMetadata } = require('./youtube-music');
@@ -119,7 +119,11 @@ function shuffle(items) {
 // A slower lookup for an earlier DM must not overwrite a newer choice.
 const pendingSubmissions = new Map();
 
-async function handleDm(message) {
+function allSongsSubmitted(run) {
+  return run.participantIds.length > 0 && run.participantIds.every(id => run.submissions[id]);
+}
+
+async function handleDm(message, client = message.client) {
   const found = findCollectingRunForUser(message.author.id);
   if (!found) return;
   const [guildId, guildData] = found;
@@ -152,7 +156,10 @@ async function handleDm(message) {
       await message.reply('The submission window for that Song of the Day run has closed.');
       return;
     }
-    await message.reply(songChosen(metadata));
+    // Close synchronously before sending replies so the last submission locks
+    // the queue immediately, even if Discord takes time to acknowledge the DM.
+    const closing = allSongsSubmitted(getGuild(guildId).run) ? finishCollection(client, guildId) : null;
+    await Promise.all([closing, message.reply(songChosen(metadata))]);
   } finally {
     if (pendingSubmissions.get(key) === request) pendingSubmissions.delete(key);
   }
@@ -205,19 +212,52 @@ async function sendCurrent(client, guildId) {
   return true;
 }
 
+const announcing = new Set();
+async function announceRunStarted(client, guildId) {
+  if (announcing.has(guildId)) return false;
+  announcing.add(guildId);
+  try {
+    const data = getGuild(guildId);
+    const run = data.run;
+    if (!run?.startAnnouncementPending || !['waiting', 'presenting'].includes(run.status)) return true;
+    const channel = await client.channels.fetch(run.channelId);
+    const fresh = getGuild(guildId).run;
+    if (fresh?.id !== run.id || !['waiting', 'presenting'].includes(fresh.status)) return false;
+    const roleId = run.roleId || data.roleId;
+    await channel.send({
+      content: runStarted(roleId, run.firstPostAt, run.allSubmittedAtClose),
+      allowedMentions: { roles: [roleId] }
+    });
+    updateGuild(guildId, guild => {
+      if (guild.run?.id === run.id) guild.run.startAnnouncementPending = false;
+      return guild;
+    });
+    return true;
+  } finally {
+    announcing.delete(guildId);
+  }
+}
+
 async function finishCollection(client, guildId) {
   const data = getGuild(guildId);
   if (data.run?.status !== 'collecting') return null;
   const schedule = shuffle(Object.entries(data.run.submissions).map(([userId, song]) => ({ userId, ...song })));
   const excludedCount = data.run.participantIds.filter((userId) => !data.run.submissions[userId]).length;
+  const closedAt = new Date().toISOString();
+  const firstPostAt = schedule.length ? (data.run.dailyTime ? nextDaily(data.run.dailyTime, data.run.timezone) : closedAt) : null;
   updateGuild(guildId, (guild) => {
     guild.run.status = schedule.length ? (guild.run.dailyTime ? 'waiting' : 'presenting') : 'ended';
     guild.run.schedule = schedule;
     guild.run.currentIndex = 0;
-    guild.run.nextPostAt = guild.run.dailyTime ? nextDaily(guild.run.dailyTime, guild.run.timezone) : null;
-    guild.run.endedAt = schedule.length ? null : new Date().toISOString();
+    guild.run.nextPostAt = guild.run.dailyTime ? firstPostAt : null;
+    guild.run.firstPostAt = firstPostAt;
+    guild.run.selectionClosedAt = closedAt;
+    guild.run.allSubmittedAtClose = allSongsSubmitted(guild.run);
+    guild.run.startAnnouncementPending = schedule.length > 0;
+    guild.run.endedAt = schedule.length ? null : closedAt;
     return guild;
   });
+  if (schedule.length) await announceRunStarted(client, guildId);
   if (schedule.length && !data.run.dailyTime) await postCurrent(client, guildId);
   if (!schedule.length) {
     const channel = await client.channels.fetch(data.run.channelId).catch(() => null);
@@ -229,16 +269,21 @@ async function finishCollection(client, guildId) {
 async function schedulerTick(client) {
   const guildIds = client.guilds.cache.map((guild) => guild.id);
   for (const guildId of guildIds) {
-    const data = getGuild(guildId);
-    const run = data.run;
+    let data = getGuild(guildId);
+    let run = data.run;
     if (!run || run.status === 'ended') continue;
+    if (run.startAnnouncementPending) {
+      if (!await announceRunStarted(client, guildId)) continue;
+      data = getGuild(guildId);
+      run = data.run;
+      if (!run || run.status === 'ended') continue;
+    }
     if (run.status === 'collecting') {
       const deadline = new Date(run.collectionEndsAt).getTime();
-      if (!run.allSubmittedNotified && run.participantIds.length && run.participantIds.every(id => run.submissions[id]) && Date.now() < deadline) {
-        const channel = await client.channels.fetch(run.channelId);
-        const roleId = run.roleId || data.roleId;
-        await channel.send({ content: `<@&${roleId}> Everyone has submitted a song! A manager can use /skip-song-selection to close selection early.`, allowedMentions: { roles: [roleId] } });
-        updateGuild(guildId, guild => { if (guild.run?.id === run.id) guild.run.allSubmittedNotified = true; return guild; });
+      // Recover completed collection after a restart, including older runs.
+      if (allSongsSubmitted(run) || Date.now() >= deadline) {
+        await finishCollection(client, guildId);
+        continue;
       }
       const reminder = deadline - DAY;
       if (!run.reminderSent && Date.now() >= reminder && Date.now() < deadline) {
@@ -248,6 +293,9 @@ async function schedulerTick(client) {
           if (current?.id !== run.id || current.status !== 'collecting') break;
           if (current.submissions[id]) continue;
           const user = await client.users.fetch(id).catch(() => null);
+          const latest = getGuild(guildId).run;
+          if (latest?.id !== run.id || latest.status !== 'collecting' || Date.now() >= deadline) break;
+          if (latest.submissions[id]) continue;
           if (user) await user.send(`Song selection ends <t:${Math.floor(deadline / 1000)}:R>. This is your 24-hour reminder to submit a song link.`).catch(() => null);
         }
         updateGuild(guildId, (guild) => { if (guild.run?.id === run.id) guild.run.reminderSent = true; return guild; });

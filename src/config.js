@@ -9,5 +9,6 @@ function required(name) {
 module.exports = {
   token: required('DISCORD_TOKEN'),
   clientId: required('DISCORD_CLIENT_ID'),
-  guildId: process.env.DISCORD_GUILD_ID || null
+  guildId: process.env.DISCORD_GUILD_ID || null,
+  timezone: process.env.SOTD_TIMEZONE || require('./schedule').DEFAULT_TIMEZONE
 };

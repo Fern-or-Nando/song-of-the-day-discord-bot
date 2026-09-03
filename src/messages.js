@@ -17,4 +17,10 @@ function songAnnouncement(roleId, userId, song, url) {
   return `<@&${roleId}> song of the day is ${songLabel(song)} choosen by <@${userId}>\n${url}`;
 }
 
-module.exports = { SONG_SELECTION_PROMPT, RUN_ENDED, selectionStarted, songLabel, songChosen, songAnnouncement };
+function runStarted(roleId, firstPostAt, everyoneSubmitted) {
+  const reason = everyoneSubmitted ? 'Everyone has submitted a song. ' : '';
+  return `<@&${roleId}> ${reason}Song selection has ended. The Song of the Day run has started! ` +
+    `The first song will be announced <t:${Math.floor(Date.parse(firstPostAt) / 1000)}:F>.`;
+}
+
+module.exports = { SONG_SELECTION_PROMPT, RUN_ENDED, selectionStarted, songLabel, songChosen, songAnnouncement, runStarted };
